@@ -5,5 +5,7 @@
 !main.cpp
 !vertex_input_fs.glsl
 !vertex_input_vs.glsl
+!vertex_input_fs.spv
+!vertex_input_vs.spv
 !vulkan-basic-triangle.sln
 !vulkan-basic-triangle.vcxproj
