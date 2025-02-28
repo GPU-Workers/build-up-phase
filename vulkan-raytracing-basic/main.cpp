@@ -6,7 +6,13 @@
 #include <tuple>
 #include <bitset>
 #include <span>
+#include <unordered_map>
 #include "shader_module.h"
+
+#define TINYOBJLOADER_IMPLEMENTATION // define this in only *one* .cc
+// Optional. define TINYOBJLOADER_USE_MAPBOX_EARCUT gives robust triangulation. Requires C++11
+//#define TINYOBJLOADER_USE_MAPBOX_EARCUT
+#include "tiny_obj_loader.h"
 
 typedef unsigned int uint;
 
@@ -231,6 +237,47 @@ bool checkDeviceExtensionSupport(VkPhysicalDevice device, std::vector<const char
 
     return true;
 }
+
+// Define a hash function for std::tuple<int, int>
+struct tuple_hash {
+    template <typename T1, typename T2>
+    std::size_t operator()(const std::tuple<T1, T2>& t) const {
+        return std::hash<T1>()(std::get<0>(t)) ^ (std::hash<T2>()(std::get<1>(t)) << 1);
+    }
+};
+
+struct Geometry
+{
+    tinyobj::ObjReaderConfig reader_config;
+    tinyobj::ObjReader reader;
+
+    std::vector<float> vertData;
+    std::vector<uint32_t> idxData;
+
+    void readfile(const std::string& inputfile) {
+        if (!reader.ParseFromFile(inputfile, reader_config)) {
+            if (!reader.Error().empty()) {
+                std::cerr << "TinyObjReader: " << reader.Error();
+            }
+            exit(1);
+        }
+
+        if (!reader.Warning().empty()) {
+            std::cout << "TinyObjReader: " << reader.Warning();
+        }
+
+        const auto& attrib = reader.GetAttrib();
+        const auto& shapes = reader.GetShapes();
+
+        vertData = attrib.vertices;
+
+        idxData.resize(shapes[0].mesh.indices.size());
+        for (uint32_t idx = 0; idx < shapes[0].mesh.indices.size(); ++idx) {
+            const auto& vertIdx = shapes[0].mesh.indices[idx].vertex_index;
+            idxData[idx] = static_cast<uint32_t>(vertIdx);
+        }
+    }
+} geo;
 
 GLFWwindow* createWindow()
 {
@@ -673,13 +720,8 @@ inline VkDeviceAddress getDeviceAddressOf(VkAccelerationStructureKHR as)
 
 void createBLAS()
 {
-    float vertices[][3] = {
-        { -1.0f, -1.0f, 0.0f },
-        {  1.0f, -1.0f, 0.0f },
-        {  1.0f,  1.0f, 0.0f },
-        { -1.0f,  1.0f, 0.0f },
-    };
-    uint32_t indices[] = { 0, 1, 3, 1, 2, 3 };
+    std::vector<float> vertices = geo.vertData;
+    std::vector<uint32_t> indices = geo.idxData;
 
     VkTransformMatrixKHR geoTransforms[] = {
         {
@@ -694,13 +736,16 @@ void createBLAS()
         },
     };
 
+    auto vertSize = sizeof(vertices[0]) * vertices.size();
+    auto indSize = sizeof(indices[0]) * indices.size();
+
     auto [vertexBuffer, vertexBufferMem] = createBuffer(
-        sizeof(vertices), 
+        vertSize,
         VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     
     auto [indexBuffer, indexBufferMem] = createBuffer(
-        sizeof(indices), 
+        indSize,
         VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
@@ -711,12 +756,12 @@ void createBLAS()
     
     void* dst;
 
-    vkMapMemory(vk.device, vertexBufferMem, 0, sizeof(vertices), 0, &dst);
-    memcpy(dst, vertices, sizeof(vertices));
+    vkMapMemory(vk.device, vertexBufferMem, 0, vertSize, 0, &dst);
+    memcpy(dst, vertices.data(), vertSize);
     vkUnmapMemory(vk.device, vertexBufferMem);
 
-    vkMapMemory(vk.device, indexBufferMem, 0, sizeof(indices), 0, &dst);
-    memcpy(dst, indices, sizeof(indices));
+    vkMapMemory(vk.device, indexBufferMem, 0, indSize, 0, &dst);
+    memcpy(dst, indices.data(), indSize);
     vkUnmapMemory(vk.device, indexBufferMem);
 
     vkMapMemory(vk.device, geoTransformBufferMem, 0, sizeof(geoTransforms), 0, &dst);
@@ -731,8 +776,8 @@ void createBLAS()
                 .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR,
                 .vertexFormat = VK_FORMAT_R32G32B32_SFLOAT,
                 .vertexData = { .deviceAddress = getDeviceAddressOf(vertexBuffer) },
-                .vertexStride = sizeof(vertices[0]),
-                .maxVertex = sizeof(vertices) / sizeof(vertices[0]) - 1,
+                .vertexStride = sizeof(vertices[0]) * 3,
+                .maxVertex = static_cast<uint32_t>(vertices.size() / 3) - 1,
                 .indexType = VK_INDEX_TYPE_UINT32,
                 .indexData = { .deviceAddress = getDeviceAddressOf(indexBuffer) },
                 .transformData = { .deviceAddress = getDeviceAddressOf(geoTransformBuffer) },
@@ -742,7 +787,7 @@ void createBLAS()
     };
     VkAccelerationStructureGeometryKHR geometries[] = { geometry0, geometry0 };
 
-    uint32_t triangleCount0 = sizeof(indices) / (sizeof(indices[0]) * 3);
+    uint32_t triangleCount0 = static_cast<uint32_t>(indices.size()) / 3;
     uint32_t triangleCounts[] = { triangleCount0, triangleCount0 };
 
     VkAccelerationStructureBuildGeometryInfoKHR buildBlasInfo{
@@ -968,10 +1013,6 @@ void createOutImage()
         .image = vk.outImage,
         .viewType = VK_IMAGE_VIEW_TYPE_2D,
         .format = format,
-        .components = {
-            .r = VK_COMPONENT_SWIZZLE_B,
-            .b = VK_COMPONENT_SWIZZLE_R,
-        },
         .subresourceRange = subresourceRange,
     };
     vkCreateImageView(vk.device, &ci0, nullptr, &vk.outImageView);
@@ -1051,7 +1092,7 @@ void main()
         g.cameraPos, 0.0, rayDir, 100.0,    // origin, tmin, direction, tmax
         0);                                 // payload
 
-    imageStore(image, ivec2(gl_LaunchIDEXT.xy), vec4(hitValue, 0.0));
+    imageStore(image, ivec2(gl_LaunchIDEXT.xy), vec4(hitValue.bgr, 0.0));
 })";
 
 const char* miss_src = R"(
@@ -1433,6 +1474,7 @@ int main()
     createCommandCenter();
     createSyncObjects();
 
+    geo.readfile("box.obj");
     createBLAS();
     createTLAS();
     createOutImage();
